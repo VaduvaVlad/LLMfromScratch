@@ -1,8 +1,9 @@
 from transformers import AutoTokenizer
 
+from config.config import config
 
 class Tokenizer():
-    def __init__(self, tokenizer_model):
+    def __init__(self, tokenizer_model=config.tokenizer):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
 
     def Encode(self, text:str):
