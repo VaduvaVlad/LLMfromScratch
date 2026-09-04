@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from src.tokenizer.tokenizer_default import Tokenizer
@@ -62,7 +64,29 @@ class Decoder(nn.Module):
         self.fc_out.weight = self.word_embedding.weight
 
         self.max_len = max_len
+
+        # nn.Embedding defaults to N(0,1). tied to the output head that makes
+        # logits ~50x too large (loss starts near 240 instead of ln(vocab)=10.8)
+        # and the model wastes much of training just shrinking that scale
+        self.apply(self._init_weights)
+
+        # gpt2's residual scaling: the two projections that write back into the
+        # residual stream are shrunk by 1/sqrt(2*layers) so the stream's
+        # variance doesn't grow with depth
+        residual_std = 0.02/math.sqrt(2*num_layers)
+        for name,param in self.named_parameters():
+            if name.endswith("attention.fc_out.weight") or name.endswith("feed_forward.2.weight"):
+                nn.init.normal_(param,mean=0.0,std=residual_std)
+
         self.to(self.device)
+
+    def _init_weights(self,module):
+        if isinstance(module,nn.Linear):
+            nn.init.normal_(module.weight,mean=0.0,std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            nn.init.normal_(module.weight,mean=0.0,std=0.02)
 
     def encode(self,text):
         # convenience for running raw text through the model outside of training,

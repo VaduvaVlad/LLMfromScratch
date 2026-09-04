@@ -1,3 +1,4 @@
+import math
 import os
 import urllib.request
 
@@ -110,57 +111,113 @@ class TextDataset(Dataset):
         return x.long(), y.long()
 
 
-def train(model,dataloader,optimizer,loss_fn,epochs,device):
+def make_optimizer(model,lr,weight_decay=0.1):
+    """AdamW with decay on weight matrices only.
+
+    Weight decay on biases and LayerNorm gains hurts - they are meant to be
+    free to sit anywhere, not pulled toward zero. betas=(0.9,0.95) rather than
+    the (0.9,0.999) default is the standard choice for language models.
+    """
+    decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    no_decay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    return torch.optim.AdamW(
+        [{"params": decay, "weight_decay": weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr, betas=(0.9,0.95),
+    )
+
+
+def make_scheduler(optimizer,warmup_steps,total_steps):
+    """Linear warmup then cosine decay to zero.
+
+    Warmup stops the first few steps - when the model is random and gradients
+    are huge - from wrecking the weights. Cosine decay lets it settle into a
+    minimum instead of bouncing around it at full learning rate.
+    """
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step/max(1,warmup_steps)
+        progress = (step - warmup_steps)/max(1,total_steps - warmup_steps)
+        return 0.5*(1.0 + math.cos(math.pi*min(1.0,progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda)
+
+
+def save_checkpoint(model,model_config,path=CHECKPOINT_PATH):
+    # weights + the constructor args needed to rebuild the same architecture,
+    # so inference doesn't have to guess or hardcode them
+    os.makedirs(os.path.dirname(path),exist_ok=True)
+    torch.save({"model_state": model.state_dict(), "config": model_config},path)
+    print(f"saved checkpoint to {path}",flush=True)
+
+
+def train(model,dataloader,optimizer,loss_fn,epochs,device,
+          scheduler=None,clip=1.0,amp=True,log_every=50,
+          model_config=None,checkpoint_path=CHECKPOINT_PATH):
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
         for step,(x,y) in enumerate(dataloader):
-            x,y = x.to(device), y.to(device)
+            x,y = x.to(device,non_blocking=True), y.to(device,non_blocking=True)
 
-            logits = model(x)                                        # (N,seq_len,vocab_size)
-            loss = loss_fn(logits.reshape(-1,logits.size(-1)),y.reshape(-1))
+            # bf16 autocast: ~2x faster on a 4090 and halves activation memory.
+            # bf16 has the same exponent range as fp32, so unlike fp16 it needs
+            # no gradient scaler
+            with torch.autocast(device_type="cuda",dtype=torch.bfloat16,enabled=amp):
+                logits = model(x)                                    # (N,seq_len,vocab_size)
+                loss = loss_fn(logits.reshape(-1,logits.size(-1)),y.reshape(-1))
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if clip:
+                # one bad batch can produce a huge gradient and blow up the
+                # weights; clipping bounds the step size
+                torch.nn.utils.clip_grad_norm_(model.parameters(),clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             total_loss += loss.item()
-            if step % 50 == 0:
-                print(f"epoch {epoch} step {step}/{len(dataloader)}: loss {loss.item():.4f}")
+            if step % log_every == 0:
+                lr = optimizer.param_groups[0]["lr"]
+                print(f"epoch {epoch} step {step}/{len(dataloader)}: "
+                      f"loss {loss.item():.4f} lr {lr:.2e}",flush=True)
 
-        print(f"epoch {epoch} done: avg loss {total_loss/len(dataloader):.4f}")
+        print(f"epoch {epoch} done: avg loss {total_loss/len(dataloader):.4f}",flush=True)
+
+        # save every epoch, not just at the end: a multi-hour run that dies
+        # part way should not lose everything
+        if model_config is not None:
+            save_checkpoint(model,model_config,checkpoint_path)
 
 
 if __name__ == "__main__":
     seq_len = 512
-    # 24 and 36 train at the same tokens/sec on a 4090, but 36 peaks at 18.5GB
-    # vs 12.6GB - the extra 6GB buys nothing and OOMs if anything else (chat.py)
-    # is holding GPU memory
     batch_size = 24
-    # 2 passes over the full 253M-token set beats 10 passes over a 24M-token
-    # slice: same compute, 10x more unique data, far less memorisation. ~500M
-    # training tokens is also roughly chinchilla-optimal for a 30M param model
+    # 2 passes over the full 253M-token set beats more passes over a slice:
+    # same compute, more unique data, far less memorisation
     epochs = 2
     lr = 3e-4
     num_conversations = None
 
-    # bigger than the shakespeare run: holding a conversation needs far more
-    # capacity than mimicking verse structure
-    model_config = dict(emb_size=384,heads=6,num_layers=6,max_len=seq_len)
+    # gpt2-small scale. the 30M version reached loss 2.78 - it modelled english
+    # and assistant formatting fine, but had nowhere to store meaning. the
+    # bottleneck was capacity, not data, so this is the change that matters.
+    # dropout 0 because 253M tokens against 124M params cannot overfit: at this
+    # ratio dropout is just noise
+    model_config = dict(emb_size=768,heads=12,num_layers=12,max_len=seq_len,dropout=0.0)
     model = Decoder(**model_config)
-    print(f"model params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"model params: {sum(p.numel() for p in model.parameters()):,}",flush=True)
 
     tokens = load_ultrachat(model.tokenizer,num_conversations)
     dataset = TextDataset(tokens,seq_len,stride=seq_len)
-    dataloader = DataLoader(dataset,batch_size=batch_size,shuffle=True)
+    dataloader = DataLoader(dataset,batch_size=batch_size,shuffle=True,
+                            num_workers=2,pin_memory=True,drop_last=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(),lr=lr)
+    total_steps = len(dataloader)*epochs
+    optimizer = make_optimizer(model,lr)
+    scheduler = make_scheduler(optimizer,warmup_steps=min(2000,total_steps//20),
+                               total_steps=total_steps)
     loss_fn = nn.CrossEntropyLoss()
 
-    train(model,dataloader,optimizer,loss_fn,epochs,model.device)
-
-    # save weights + the constructor args needed to rebuild the same
-    # architecture, so inference doesn't have to guess or hardcode them
-    os.makedirs(os.path.dirname(CHECKPOINT_PATH),exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "config": model_config},CHECKPOINT_PATH)
-    print(f"saved checkpoint to {CHECKPOINT_PATH}")
+    train(model,dataloader,optimizer,loss_fn,epochs,model.device,
+          scheduler=scheduler,model_config=model_config)
