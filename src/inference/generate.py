@@ -19,7 +19,7 @@ def load_model(checkpoint_path=CHECKPOINT_PATH):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("prompt",nargs="?",default="ROMEO:")
+    parser.add_argument("prompt",nargs="?",default="Hello:")
     parser.add_argument("--max_new_tokens",type=int,default=200)
     parser.add_argument("--temperature",type=float,default=0.8)
     parser.add_argument("--top_k",type=int,default=50)

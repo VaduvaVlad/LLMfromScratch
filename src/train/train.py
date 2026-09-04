@@ -6,10 +6,12 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from src.transformer.transformer import Decoder
+from src.tokenizer.tokenizer_default import USER_TOKEN, ASSISTANT_TOKEN
 
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "tinyshakespeare.txt")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "decoder.pt")
+ULTRACHAT_CACHE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "ultrachat_tokens.pt")
 
 
 def download_dataset(path=DATA_PATH,url=DATA_URL):
@@ -18,6 +20,55 @@ def download_dataset(path=DATA_PATH,url=DATA_URL):
         urllib.request.urlretrieve(url,path)
     with open(path,"r",encoding="utf-8") as f:
         return f.read()
+
+
+def format_conversation(messages):
+    """Flatten one UltraChat conversation into a single training string.
+
+    <|user|>...<|assistant|>...<|user|>...<|assistant|>...<|endoftext|>
+
+    The markers are what teach turn-taking: the model learns that text after
+    <|assistant|> is its own to produce, and that a turn ends at the next marker.
+    """
+    parts = []
+    for message in messages:
+        marker = USER_TOKEN if message["role"] == "user" else ASSISTANT_TOKEN
+        parts.append(marker + message["content"])
+    return "".join(parts)
+
+
+def load_ultrachat(tokenizer,num_conversations=20000,cache_path=ULTRACHAT_CACHE):
+    """Tokenize N UltraChat conversations into one flat token stream.
+
+    Cached to disk because tokenizing is slow and rerunning training
+    shouldn't pay that cost twice.
+    """
+    if os.path.exists(cache_path):
+        print(f"loading cached tokens from {cache_path}")
+        return torch.load(cache_path)
+
+    from datasets import load_dataset
+
+    print(f"downloading + tokenizing {num_conversations} conversations...")
+    dataset = load_dataset("HuggingFaceH4/ultrachat_200k",split="train_sft")
+    dataset = dataset.select(range(min(num_conversations,len(dataset))))
+
+    texts = [format_conversation(ex["messages"]) + tokenizer.tokenizer.eos_token
+             for ex in dataset]
+
+    # batch encode: far faster than calling Encode() once per conversation
+    encoded = tokenizer.tokenizer(texts)["input_ids"]
+
+    ids = []
+    for conversation in encoded:
+        ids.extend(conversation)
+
+    tokens = torch.tensor(ids,dtype=torch.long)
+
+    os.makedirs(os.path.dirname(cache_path),exist_ok=True)
+    torch.save(tokens,cache_path)
+    print(f"cached {len(tokens):,} tokens to {cache_path}")
+    return tokens
 
 
 class TextDataset(Dataset):
@@ -29,16 +80,22 @@ class TextDataset(Dataset):
     training signal out of the same text than chopping it into disjoint blocks.
     """
 
-    def __init__(self,tokens,seq_len):
+    def __init__(self,tokens,seq_len,stride=1):
+        # stride=1 gives a window starting at every token - maximum reuse of a
+        # small corpus. stride=seq_len gives disjoint chunks, which is what you
+        # want once the corpus is large: 25M tokens at stride 1 would be 25M
+        # samples (a million+ steps per epoch) for no real benefit
         self.tokens = tokens
         self.seq_len = seq_len
+        self.stride = stride
 
     def __len__(self):
-        return len(self.tokens) - self.seq_len
+        return max(0,(len(self.tokens) - self.seq_len - 1)//self.stride + 1)
 
     def __getitem__(self,i):
-        x = self.tokens[i:i+self.seq_len]
-        y = self.tokens[i+1:i+self.seq_len+1]
+        start = i*self.stride
+        x = self.tokens[start:start+self.seq_len]
+        y = self.tokens[start+1:start+self.seq_len+1]
         return x,y
 
 
@@ -64,17 +121,20 @@ def train(model,dataloader,optimizer,loss_fn,epochs,device):
 
 
 if __name__ == "__main__":
-    seq_len = 128
-    batch_size = 128
-    epochs = 3
+    seq_len = 512
+    batch_size = 36
+    epochs = 10
     lr = 3e-4
+    num_conversations = 20000
 
-    model_config = dict(emb_size=128,heads=8,num_layers=4,max_len=seq_len)
+    # bigger than the shakespeare run: holding a conversation needs far more
+    # capacity than mimicking verse structure
+    model_config = dict(emb_size=384,heads=6,num_layers=6,max_len=seq_len)
     model = Decoder(**model_config)
+    print(f"model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    text = download_dataset()
-    tokens = torch.tensor(model.tokenizer.Encode(text))
-    dataset = TextDataset(tokens,seq_len)
+    tokens = load_ultrachat(model.tokenizer,num_conversations)
+    dataset = TextDataset(tokens,seq_len,stride=seq_len)
     dataloader = DataLoader(dataset,batch_size=batch_size,shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(),lr=lr)

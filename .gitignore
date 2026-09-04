@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# generated artifacts: re-created by train.py, and far over github's 100MB limit
+data/
+checkpoints/

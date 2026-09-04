@@ -61,9 +61,13 @@ class Attention(nn.Module):
         assert (
             self.head_dim * heads == embed_size), "Embed size should be divisible by hears"
 
-        self.query = nn.Linear(self.head_dim,self.head_dim,bias=False)
-        self.key = nn.Linear(self.head_dim,self.head_dim,bias=False)
-        self.values = nn.Linear(self.head_dim,self.head_dim,bias=False)
+        # project the whole embedding, not each head's slice separately.
+        # a head_dim -> head_dim projection would lock head h to input dims
+        # [h*head_dim : (h+1)*head_dim] forever; projecting embed_size ->
+        # embed_size lets every head build its query from the full vector
+        self.query = nn.Linear(embed_size,embed_size,bias=False)
+        self.key = nn.Linear(embed_size,embed_size,bias=False)
+        self.values = nn.Linear(embed_size,embed_size,bias=False)
 
         self.rotary = RotaryEmbedding(self.head_dim,max_len)
 
@@ -73,16 +77,12 @@ class Attention(nn.Module):
         N = query.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
-        # split the embedding into self.heads pieces
-        values = values.reshape(N,value_len,self.heads,self.head_dim)
-        keys = keys.reshape(N,key_len,self.heads,self.head_dim)
-        queries = query.reshape(N,query_len,self.heads,self.head_dim)
-
-        # move heads next to the batch dim so it acts as a batch dim for the matmuls
-        # (N,len,heads,head_dim) -> (N,heads,len,head_dim)
-        values = self.values(values).transpose(1,2)
-        keys = self.key(keys).transpose(1,2)
-        queries = self.query(queries).transpose(1,2)
+        # project on the full embedding FIRST, then split into heads and move
+        # heads next to the batch dim so it acts as a batch dim for the matmuls
+        # (N,len,embed_size) -> (N,len,heads,head_dim) -> (N,heads,len,head_dim)
+        values = self.values(values).reshape(N,value_len,self.heads,self.head_dim).transpose(1,2)
+        keys = self.key(keys).reshape(N,key_len,self.heads,self.head_dim).transpose(1,2)
+        queries = self.query(query).reshape(N,query_len,self.heads,self.head_dim).transpose(1,2)
 
         # rotate queries and keys by their position. values are NOT rotated:
         # position belongs in the scores, not in the content being summed

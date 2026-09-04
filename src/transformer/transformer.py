@@ -86,19 +86,21 @@ class Decoder(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self,prompt,max_new_tokens=100,temperature=1.0,top_k=None):
-        """Autoregressive sampling: feed the prompt, repeatedly predict one
-        more token from everything generated so far, append it, repeat.
+    def generate_tokens(self,tokens,max_new_tokens=100,temperature=1.0,top_k=None,stop_ids=None):
+        """Autoregressive sampling: feed the tokens, repeatedly predict one
+        more from everything so far, append it, repeat.
 
         There is no KV cache, so each step reruns the whole growing sequence
         through every layer - simple and correct, but O(n^2) in tokens. Fine
         for a small model; a real serving setup caches past keys/values instead.
+
+        tokens: (1,seq_len) -> returns (1,seq_len+n)
         """
         was_training = self.training
         self.eval()
 
-        tokens = self.encode(prompt)                            # (1,seq_len)
-        eos_id = getattr(self.tokenizer.tokenizer,"eos_token_id",None)
+        if stop_ids is None:
+            stop_ids = {self.tokenizer.eos_id}
 
         for _ in range(max_new_tokens):
             # RoPE's table only covers max_len positions, so once the
@@ -116,10 +118,16 @@ class Decoder(nn.Module):
             next_token = torch.multinomial(probs,num_samples=1)  # (1,1)
             tokens = torch.cat([tokens,next_token],dim=1)
 
-            if eos_id is not None and next_token.item() == eos_id:
+            if next_token.item() in stop_ids:
                 break
 
         self.train(was_training)
+        return tokens
+
+    def generate(self,prompt,max_new_tokens=100,temperature=1.0,top_k=None,stop_ids=None):
+        tokens = self.generate_tokens(
+            self.encode(prompt),max_new_tokens,temperature,top_k,stop_ids
+        )
         return self.tokenizer.Decode(tokens[0].tolist())
 
 
