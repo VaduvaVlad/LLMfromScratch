@@ -11,7 +11,7 @@ from src.tokenizer.tokenizer_default import USER_TOKEN, ASSISTANT_TOKEN
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "tinyshakespeare.txt")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "decoder.pt")
-ULTRACHAT_CACHE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "ultrachat_tokens.pt")
+ULTRACHAT_CACHE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "ultrachat_tokens_{n}.pt")
 
 
 def download_dataset(path=DATA_PATH,url=DATA_URL):
@@ -37,37 +37,46 @@ def format_conversation(messages):
     return "".join(parts)
 
 
-def load_ultrachat(tokenizer,num_conversations=20000,cache_path=ULTRACHAT_CACHE):
+def load_ultrachat(tokenizer,num_conversations=None,cache_template=ULTRACHAT_CACHE,chunk=2000):
     """Tokenize N UltraChat conversations into one flat token stream.
 
-    Cached to disk because tokenizing is slow and rerunning training
-    shouldn't pay that cost twice.
+    num_conversations=None uses the whole split. The count is part of the cache
+    filename, otherwise changing it would silently reuse the wrong cache.
     """
+    cache_path = cache_template.format(n=num_conversations or "all")
+
     if os.path.exists(cache_path):
-        print(f"loading cached tokens from {cache_path}")
+        print(f"loading cached tokens from {cache_path}",flush=True)
         return torch.load(cache_path)
 
+    import numpy as np
     from datasets import load_dataset
 
-    print(f"downloading + tokenizing {num_conversations} conversations...")
     dataset = load_dataset("HuggingFaceH4/ultrachat_200k",split="train_sft")
-    dataset = dataset.select(range(min(num_conversations,len(dataset))))
+    if num_conversations is not None:
+        dataset = dataset.select(range(min(num_conversations,len(dataset))))
+    print(f"tokenizing {len(dataset):,} conversations...",flush=True)
 
-    texts = [format_conversation(ex["messages"]) + tokenizer.tokenizer.eos_token
-             for ex in dataset]
+    eos = tokenizer.tokenizer.eos_token
 
-    # batch encode: far faster than calling Encode() once per conversation
-    encoded = tokenizer.tokenizer(texts)["input_ids"]
+    # accumulate numpy arrays rather than one giant python list: 250M python
+    # ints would cost several GB in object overhead alone
+    pieces = []
+    for start in range(0,len(dataset),chunk):
+        batch = dataset[start:start+chunk]
+        texts = [format_conversation(m) + eos for m in batch["messages"]]
 
-    ids = []
-    for conversation in encoded:
-        ids.extend(conversation)
+        # batch encode: far faster than calling Encode() once per conversation
+        for conversation in tokenizer.tokenizer(texts)["input_ids"]:
+            pieces.append(np.asarray(conversation,dtype=np.int32))
 
-    tokens = torch.tensor(ids,dtype=torch.long)
+        print(f"  {min(start+chunk,len(dataset)):,}/{len(dataset):,}",flush=True)
+
+    tokens = torch.from_numpy(np.concatenate(pieces))
 
     os.makedirs(os.path.dirname(cache_path),exist_ok=True)
     torch.save(tokens,cache_path)
-    print(f"cached {len(tokens):,} tokens to {cache_path}")
+    print(f"cached {len(tokens):,} tokens to {cache_path}",flush=True)
     return tokens
 
 
@@ -96,7 +105,9 @@ class TextDataset(Dataset):
         start = i*self.stride
         x = self.tokens[start:start+self.seq_len]
         y = self.tokens[start+1:start+self.seq_len+1]
-        return x,y
+        # stored as int32 to halve the cache size; embedding accepts int32 but
+        # cross entropy targets must be int64, so widen both here
+        return x.long(), y.long()
 
 
 def train(model,dataloader,optimizer,loss_fn,epochs,device):
@@ -122,10 +133,16 @@ def train(model,dataloader,optimizer,loss_fn,epochs,device):
 
 if __name__ == "__main__":
     seq_len = 512
-    batch_size = 36
-    epochs = 10
+    # 24 and 36 train at the same tokens/sec on a 4090, but 36 peaks at 18.5GB
+    # vs 12.6GB - the extra 6GB buys nothing and OOMs if anything else (chat.py)
+    # is holding GPU memory
+    batch_size = 24
+    # 2 passes over the full 253M-token set beats 10 passes over a 24M-token
+    # slice: same compute, 10x more unique data, far less memorisation. ~500M
+    # training tokens is also roughly chinchilla-optimal for a 30M param model
+    epochs = 2
     lr = 3e-4
-    num_conversations = 20000
+    num_conversations = None
 
     # bigger than the shakespeare run: holding a conversation needs far more
     # capacity than mimicking verse structure
