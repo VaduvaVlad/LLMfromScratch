@@ -1,7 +1,9 @@
 import math
 import os
+import time
 import urllib.request
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -106,8 +108,11 @@ class TextDataset(Dataset):
         start = i*self.stride
         x = self.tokens[start:start+self.seq_len]
         y = self.tokens[start+1:start+self.seq_len+1]
-        # stored as int32 to halve the cache size; embedding accepts int32 but
+        # tokens are stored narrow (int32 tensor, or uint16 memmap for the
+        # pretraining corpus) to keep them on disk; embedding accepts int32 but
         # cross entropy targets must be int64, so widen both here
+        if isinstance(x,np.ndarray):
+            return torch.from_numpy(x.astype(np.int64)), torch.from_numpy(y.astype(np.int64))
         return x.long(), y.long()
 
 
@@ -150,10 +155,43 @@ def save_checkpoint(model,model_config,path=CHECKPOINT_PATH):
     print(f"saved checkpoint to {path}",flush=True)
 
 
+def save_resumable(model,model_config,optimizer,scheduler,step,path):
+    """Full training state, not just weights.
+
+    Resuming from weights alone restarts Adam's moment estimates from zero and
+    the LR schedule from the top, which visibly dents the loss. An overnight
+    run needs the optimizer and scheduler too.
+    """
+    os.makedirs(os.path.dirname(path),exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save({
+        "model_state": model.state_dict(),
+        "config": model_config,
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "step": step,
+    },tmp)
+    # write then rename: a crash mid-save leaves the previous checkpoint intact
+    os.replace(tmp,path)
+
+
+def load_resumable(path,model,optimizer=None,scheduler=None,device="cuda:0"):
+    checkpoint = torch.load(path,map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    if optimizer is not None and checkpoint.get("optimizer_state"):
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if scheduler is not None and checkpoint.get("scheduler_state"):
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+    return checkpoint.get("step",0)
+
+
 def train(model,dataloader,optimizer,loss_fn,epochs,device,
           scheduler=None,clip=1.0,amp=True,log_every=50,
-          model_config=None,checkpoint_path=CHECKPOINT_PATH):
+          model_config=None,checkpoint_path=CHECKPOINT_PATH,
+          save_every=None,start_step=0):
     model.train()
+    global_step = start_step
+    last_log = time.time()
     for epoch in range(epochs):
         total_loss = 0.0
         for step,(x,y) in enumerate(dataloader):
@@ -177,17 +215,28 @@ def train(model,dataloader,optimizer,loss_fn,epochs,device,
                 scheduler.step()
 
             total_loss += loss.item()
+            global_step += 1
+
             if step % log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"epoch {epoch} step {step}/{len(dataloader)}: "
-                      f"loss {loss.item():.4f} lr {lr:.2e}",flush=True)
+                tok_per_s = (x.numel()*log_every)/max(1e-9,time.time()-last_log)
+                eta = (len(dataloader)-step)*(time.time()-last_log)/max(1,log_every)/3600
+                last_log = time.time()
+                print(f"epoch {epoch} step {step}/{len(dataloader)} "
+                      f"(global {global_step}): loss {loss.item():.4f} lr {lr:.2e} "
+                      f"| {tok_per_s/1000:.0f}k tok/s eta {eta:.1f}h",flush=True)
+
+            if save_every and global_step % save_every == 0 and model_config is not None:
+                save_resumable(model,model_config,optimizer,scheduler,global_step,checkpoint_path)
 
         print(f"epoch {epoch} done: avg loss {total_loss/len(dataloader):.4f}",flush=True)
 
         # save every epoch, not just at the end: a multi-hour run that dies
         # part way should not lose everything
         if model_config is not None:
-            save_checkpoint(model,model_config,checkpoint_path)
+            save_resumable(model,model_config,optimizer,scheduler,global_step,checkpoint_path)
+            print(f"saved checkpoint to {checkpoint_path}",flush=True)
+    return global_step
 
 
 if __name__ == "__main__":
